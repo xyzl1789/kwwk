@@ -196,6 +196,16 @@ struct SpawnedBashProcess: Sendable {
 
     let pid: pid_t
 
+    /// Whether `shellPath` names a shell that reads Bourne (POSIX `sh`)
+    /// syntax, judged by its file name.
+    static func isBourneShell(_ shellPath: String) -> Bool {
+        let shellName = URL(fileURLWithPath: shellPath).lastPathComponent.lowercased()
+        let bourneShellNames: Set<String> = [
+            "sh", "ash", "bash", "dash", "ksh", "ksh93", "mksh", "pdksh", "zsh",
+        ]
+        return bourneShellNames.contains(shellName)
+    }
+
     /// Enable pipeline failure propagation for Bourne-style shells without
     /// breaking shells that do not implement `pipefail`. Some `/bin/sh`
     /// implementations (notably dash) terminate the current shell when an
@@ -207,11 +217,7 @@ struct SpawnedBashProcess: Sendable {
         shellPath: String,
         command: String
     ) -> String {
-        let shellName = URL(fileURLWithPath: shellPath).lastPathComponent.lowercased()
-        let bourneShellNames: Set<String> = [
-            "sh", "ash", "bash", "dash", "ksh", "ksh93", "mksh", "pdksh", "zsh",
-        ]
-        guard bourneShellNames.contains(shellName) else { return command }
+        guard isBourneShell(shellPath) else { return command }
 
         return """
         if (set -o pipefail) >/dev/null 2>&1; then

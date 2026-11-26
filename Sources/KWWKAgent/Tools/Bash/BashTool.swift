@@ -22,10 +22,14 @@ public let kwwkDefaultShellPath = "/bin/sh"
 /// Runtime command boundary for shell-enabled coding tools.
 ///
 /// `.buildAndTestOnly` is intentionally conservative: it accepts one direct
-/// build/test process and rejects shell composition, redirection, command
-/// substitution, and unrelated executables before a process is spawned. It is
-/// an accidental-destruction guard for specialist agents, not an OS sandbox;
-/// the selected build system still executes trusted project code.
+/// build/test process on a single line and rejects shell composition,
+/// redirection, expansion, comments, environment variables that change which
+/// program, library or startup script runs, and executables outside the
+/// workspace and PATH before a process is spawned. Commands are read with
+/// POSIX shell rules, so every command is rejected when the tool runs a shell
+/// of another family, such as fish. It is an accidental-destruction guard for
+/// specialist agents, not an OS sandbox; the selected build system, and the
+/// options given to it, still execute trusted project code.
 public enum BashCommandPolicy: Sendable, Equatable {
     case unrestricted
     case buildAndTestOnly
@@ -137,12 +141,19 @@ public func createBashTool(cwd: String, options: BashToolOptions) -> AgentTool {
                 defaultTimeoutSec: defaultTimeoutSec,
                 maxTimeoutSec: maxTimeoutSec
             )
-            try validateBashCommand(input.command, policy: commandPolicy)
-
             // Dispatch: background spawn → foreground-with-auto-flip → legacy pipe.
             // Only the first two paths need a manager; without one we fall
             // through to the pre-background pipe executor so older callers
-            // keep working.
+            // keep working. A custom `operations` executor's shell is unknown.
+            let usesManagerShell = manager != nil && (input.runInBackground || autoBg)
+            let localOps = usesManagerShell ? nil : ops as? LocalBashOperations
+            try validateBashCommand(
+                input.command,
+                policy: commandPolicy,
+                shellPath: usesManagerShell ? shellPath : localOps?.shellPath,
+                environment: localOps?.environment ?? environment
+            )
+
             if input.runInBackground, let manager {
                 return await runBashInBackground(
                     input: input,
@@ -280,12 +291,22 @@ private struct BashInput {
 
 private func validateBashCommand(
     _ command: String,
-    policy: BashCommandPolicy
+    policy: BashCommandPolicy,
+    shellPath: String?,
+    environment: [String: String]
 ) throws {
     guard policy == .buildAndTestOnly else { return }
     do {
+        // The parser below follows POSIX sh; another shell language could
+        // run the same text as different commands.
+        if let shellPath, !SpawnedBashProcess.isBourneShell(shellPath) {
+            throw RestrictedBashCommandError(
+                message: "shell '\(URL(fileURLWithPath: shellPath).lastPathComponent)' "
+                    + "does not use POSIX sh syntax"
+            )
+        }
         let words = try restrictedShellWords(command)
-        try validateBuildAndTestWords(words)
+        try validateBuildAndTestWords(words, environment: environment)
     } catch let error as RestrictedBashCommandError {
         throw CodingToolError.invalidArgument(
             "bash: command rejected by build-and-test policy: \(error.message). "
@@ -299,90 +320,149 @@ private struct RestrictedBashCommandError: Error {
     var message: String
 }
 
+/// One shell word as the restricted parser read it.
+private struct RestrictedShellWord {
+    /// The argument the program receives once quotes and escapes are removed.
+    var text: String
+    /// The word as written, quotes and escapes included.
+    var source: String
+    /// False when the shell may still rewrite the word: an unquoted glob
+    /// character, or an unquoted `~` at its start.
+    var isLiteral: Bool
+
+    /// The `NAME=value` this word assigns when it leads a command. The shell
+    /// reads it as an assignment only when the name is written bare.
+    var assignment: (name: String, value: String)? {
+        guard let equal = source.unicodeScalars.firstIndex(of: "="),
+              isShellName(String(String.UnicodeScalarView(source.unicodeScalars[..<equal])))
+        else { return nil }
+        return splitAssignment(text)
+    }
+}
+
 /// Parse one shell command into words while rejecting composition before the
 /// shell sees it. Quotes and backslash escapes remain available for ordinary
-/// arguments, but operators capable of adding a second process or writing an
-/// arbitrary path are forbidden. This is deliberately smaller than a shell
-/// grammar so unsupported syntax fails closed.
-private func restrictedShellWords(_ command: String) throws -> [String] {
+/// arguments, but anything that could add a second process, write an
+/// arbitrary path, or make the shell read the words differently is forbidden:
+/// operators, control characters such as newlines, comments, and `$` or
+/// backtick expansions. Only space and tab separate words, as in the shell.
+/// This is deliberately smaller than a shell grammar so unsupported syntax
+/// fails closed.
+///
+/// The command is read one Unicode scalar at a time, not one `Character`:
+/// the shell reads bytes, and a combining mark after `'` or a prepended mark
+/// before `;` would otherwise fold an ASCII quote or operator into a
+/// `Character` that no longer equals it. Every shell metacharacter is ASCII,
+/// and UTF-8 never encodes another scalar with an ASCII byte.
+private func restrictedShellWords(_ command: String) throws -> [RestrictedShellWord] {
     enum Quote: Equatable {
         case none
         case single
         case double
     }
 
-    let characters = Array(command)
+    let scalars = Array(command.unicodeScalars)
     var quote = Quote.none
     var escaped = false
-    var word = ""
-    var words: [String] = []
+    var inWord = false
+    var text = String.UnicodeScalarView()
+    var source = String.UnicodeScalarView()
+    var isLiteral = true
+    var words: [RestrictedShellWord] = []
 
-    func reject(_ syntax: Character) throws -> Never {
+    func reject(_ syntax: Unicode.Scalar) throws -> Never {
         throw RestrictedBashCommandError(
             message: "shell operator '\(syntax)' is not allowed"
         )
     }
 
+    func rejectExpansion(before next: Unicode.Scalar?) throws -> Never {
+        throw RestrictedBashCommandError(
+            message: next == "(" ? "command substitution is not allowed" : "shell expansion is not allowed"
+        )
+    }
+
     func finishWord() {
-        guard !word.isEmpty else { return }
-        words.append(word)
-        word = ""
+        guard inWord else { return }
+        words.append(RestrictedShellWord(
+            text: String(text),
+            source: String(source),
+            isLiteral: isLiteral
+        ))
+        inWord = false
+        text = String.UnicodeScalarView()
+        source = String.UnicodeScalarView()
+        isLiteral = true
     }
 
     var index = 0
-    while index < characters.count {
-        let character = characters[index]
+    while index < scalars.count {
+        let scalar = scalars[index]
+        let next = index + 1 < scalars.count ? scalars[index + 1] : nil
+        index += 1
+        if isRestrictedControlCharacter(scalar) {
+            throw RestrictedBashCommandError(
+                message: "control characters such as newlines are not allowed"
+            )
+        }
+        if quote == .none, !escaped, scalar == " " || scalar == "\t" {
+            finishWord()
+            continue
+        }
+        let startsWord = !inWord
+        inWord = true
+        source.append(scalar)
         if escaped {
-            word.append(character)
+            // Inside double quotes a backslash escapes only `$`, a backtick,
+            // `"` and `\`; before anything else the shell keeps it.
+            if quote == .double, !"$`\"\\".unicodeScalars.contains(scalar) {
+                text.append("\\")
+            }
+            text.append(scalar)
             escaped = false
-            index += 1
             continue
         }
 
         switch quote {
         case .single:
-            if character == "'" { quote = .none }
-            else { word.append(character) }
+            if scalar == "'" { quote = .none }
+            else { text.append(scalar) }
 
         case .double:
-            if character == "\"" {
+            if scalar == "\"" {
                 quote = .none
-            } else if character == "\\" {
+            } else if scalar == "\\" {
                 escaped = true
-            } else if character == "`"
-                || (character == "$"
-                    && index + 1 < characters.count
-                    && characters[index + 1] == "(") {
-                throw RestrictedBashCommandError(
-                    message: "command substitution is not allowed"
-                )
+            } else if scalar == "`" {
+                try rejectExpansion(before: "(")
+            } else if scalar == "$", dollarStartsExpansion(before: next, quoted: true) {
+                try rejectExpansion(before: next)
             } else {
-                word.append(character)
+                text.append(scalar)
             }
 
         case .none:
-            if character == "'" {
+            if scalar == "'" {
                 quote = .single
-            } else if character == "\"" {
+            } else if scalar == "\"" {
                 quote = .double
-            } else if character == "\\" {
+            } else if scalar == "\\" {
                 escaped = true
-            } else if character.isWhitespace {
-                finishWord()
-            } else if character == "`"
-                || (character == "$"
-                    && index + 1 < characters.count
-                    && characters[index + 1] == "(") {
-                throw RestrictedBashCommandError(
-                    message: "command substitution is not allowed"
-                )
-            } else if [";", "|", "&", ">", "<", "(", ")", "{", "}"].contains(character) {
-                try reject(character)
+            } else if scalar == "`" {
+                try rejectExpansion(before: "(")
+            } else if scalar == "$", dollarStartsExpansion(before: next, quoted: false) {
+                try rejectExpansion(before: next)
+            } else if scalar == "#", startsWord {
+                throw RestrictedBashCommandError(message: "shell comments are not allowed")
+            } else if ";|&><(){}".unicodeScalars.contains(scalar) {
+                try reject(scalar)
             } else {
-                word.append(character)
+                if "*?[".unicodeScalars.contains(scalar) || (scalar == "~" && startsWord) {
+                    isLiteral = false
+                }
+                text.append(scalar)
             }
         }
-        index += 1
     }
 
     guard quote == .none, !escaped else {
@@ -395,39 +475,118 @@ private func restrictedShellWords(_ command: String) throws -> [String] {
     return words
 }
 
-private func validateBuildAndTestWords(_ originalWords: [String]) throws {
-    var words = originalWords
-    while let first = words.first, isShellEnvironmentAssignment(first) {
-        words.removeFirst()
+/// C0 and C1 control characters other than tab, and DEL. A newline or
+/// carriage return ends the command for the shell and NUL truncates it.
+private func isRestrictedControlCharacter(_ scalar: Unicode.Scalar) -> Bool {
+    (scalar.value < 0x20 && scalar != "\t") || (0x7F...0x9F).contains(scalar.value)
+}
+
+/// Whether a `$` followed by `next` starts an expansion in some Bourne shell.
+/// Before anything else (a space, `/`, `|`, a closing quote, the end of the
+/// command) `$` stays literal, which keeps anchors such as `^TestFoo$`. A
+/// shell may read the bytes of a non-ASCII character as part of a name, so
+/// one of those counts as an expansion too.
+private func dollarStartsExpansion(before next: Unicode.Scalar?, quoted: Bool) -> Bool {
+    guard let next else { return false }
+    if !next.isASCII || isASCIIAlphanumeric(next) || "_{([@*#?-$!~^=+".unicodeScalars.contains(next) {
+        return true
     }
-    if words.first == "env" {
+    return !quoted && (next == "'" || next == "\"")
+}
+
+private func isASCIIAlphanumeric(_ scalar: Unicode.Scalar) -> Bool {
+    ("a"..."z").contains(scalar) || ("A"..."Z").contains(scalar) || ("0"..."9").contains(scalar)
+}
+
+private func validateBuildAndTestWords(
+    _ originalWords: [RestrictedShellWord],
+    environment: [String: String]
+) throws {
+    var words = originalWords[...]
+    // A leading `time` is a reserved word in bash, zsh and ksh, which then
+    // read the words after it as a new command, assignments included. dash
+    // runs /usr/bin/time instead, which takes the next word as the program.
+    // An assignment there means something different to each, so it is
+    // rejected.
+    if words.first?.text == "time" {
         words.removeFirst()
-        while let first = words.first,
-              first.hasPrefix("-") || isShellEnvironmentAssignment(first) {
-            words.removeFirst()
+        if let assignment = words.first?.assignment {
+            throw RestrictedBashCommandError(
+                message: "environment variable '\(assignment.name)' after 'time' is not allowed"
+            )
         }
     }
-    if words.first == "time" { words.removeFirst() }
+    while let assignment = words.first?.assignment {
+        try validateEnvironmentAssignment(assignment)
+        words.removeFirst()
+    }
+    if words.first?.text == "env" {
+        words.removeFirst()
+        // env stops reading options at `--` and at its first assignment.
+        var readsOptions = true
+        while let first = words.first {
+            if readsOptions, ["-i", "-", "--ignore-environment"].contains(first.text) {
+                words.removeFirst()
+            } else if readsOptions, first.text == "--" {
+                readsOptions = false
+                words.removeFirst()
+            } else if readsOptions, startsWithDash(first.text) {
+                throw RestrictedBashCommandError(
+                    message: "env option '\(first.text)' is not allowed"
+                )
+            } else if let assignment = splitAssignment(first.text) {
+                // env reads every word with `=` before the command as an
+                // assignment, whatever its name.
+                guard isShellName(assignment.name) else {
+                    throw RestrictedBashCommandError(
+                        message: "environment variable '\(assignment.name)' is not allowed"
+                    )
+                }
+                try validateEnvironmentAssignment(assignment)
+                readsOptions = false
+                words.removeFirst()
+            } else {
+                break
+            }
+        }
+    }
+    // In `CI=1 time swift test`, /usr/bin/time starts the next word as the
+    // program. A word with `=` there is rejected as the executable below,
+    // however a shell reads it.
+    if words.first?.text == "time" { words.removeFirst() }
     guard !words.isEmpty else {
         throw RestrictedBashCommandError(message: "missing build/test executable")
     }
 
-    if words.first == "xcrun" {
+    if words.first?.text == "xcrun" {
         words.removeFirst()
-        while let first = words.first, first.hasPrefix("-") {
+        // An option taking a value, such as `--toolchain`, would leave that
+        // value where the tool name is checked.
+        let xcrunOptions = [
+            "-v", "--verbose", "-l", "--log", "-n", "--no-cache", "-k", "--kill-cache", "-r", "--run",
+        ]
+        while let option = words.first?.text, startsWithDash(option) {
+            guard xcrunOptions.contains(option) else {
+                throw RestrictedBashCommandError(
+                    message: "xcrun option '\(option)' is not allowed"
+                )
+            }
             words.removeFirst()
         }
     }
-    if words.starts(with: ["bundle", "exec"])
-        || words.starts(with: ["poetry", "run"])
-        || words.starts(with: ["uv", "run"]) {
+    let leadingTexts = words.prefix(2).map(\.text)
+    if leadingTexts == ["bundle", "exec"]
+        || leadingTexts == ["poetry", "run"]
+        || leadingTexts == ["uv", "run"] {
         words.removeFirst(2)
     }
     guard let executableWord = words.first else {
         throw RestrictedBashCommandError(message: "missing build/test executable")
     }
-    let executable = URL(fileURLWithPath: executableWord).lastPathComponent.lowercased()
-    let arguments = Array(words.dropFirst())
+    try validateExecutableWord(executableWord, environment: environment)
+    let executable = executableWord.text.utf8.split(separator: UInt8(ascii: "/")).last
+        .map { String(decoding: $0, as: UTF8.self).lowercased() } ?? ""
+    let arguments = words.dropFirst().map(\.text)
     let loweredArguments = arguments.map { $0.lowercased() }
 
     let destructiveWords = [
@@ -465,7 +624,9 @@ private func validateBuildAndTestWords(_ originalWords: [String]) throws {
     case "mix":
         accepted = loweredArguments.first.map { ["compile", "test"].contains($0) } ?? false
     case "cmake":
-        accepted = loweredArguments.contains("--build") || loweredArguments.contains("--workflow")
+        // cmake builds only when `--build` or `--workflow` comes first;
+        // otherwise it runs another mode, such as `-E rm` or `-P <script>`.
+        accepted = loweredArguments.first.map { ["--build", "--workflow"].contains($0) } ?? false
     case "make", "gmake", "ninja":
         accepted = makeLikeArgumentsAreBuildOrTest(loweredArguments)
     case "xcodebuild":
@@ -485,12 +646,143 @@ private func validateBuildAndTestWords(_ originalWords: [String]) throws {
     }
 }
 
-private func isShellEnvironmentAssignment(_ word: String) -> Bool {
-    guard let equal = word.firstIndex(of: "=") else { return false }
-    let name = word[..<equal]
-    guard let first = name.first,
-          first == "_" || first.isLetter else { return false }
-    return name.dropFirst().allSatisfy { $0 == "_" || $0.isLetter || $0.isNumber }
+/// Variables that pick which program, shared library or startup script runs,
+/// or that load code into every interpreter a build starts, compared without
+/// case because zsh ties `path` to `PATH`. The list covers the common ways to
+/// run code from outside the build and is not exhaustive. Settings read by one
+/// build tool, such as `CC`, `RUSTC_WRAPPER`, `RUSTFLAGS` or `JAVA_HOME`, stay
+/// allowed: that tool's own command-line options reach the same settings.
+/// `HOME` stays allowed too, although it also moves where tools read their
+/// configuration and where Python finds user-installed packages.
+private let restrictedEnvironmentNames: Set<String> = [
+    // Program lookup, including the toolchain and SDK Xcode's shims pick.
+    "PATH", "SHELL", "DEVELOPER_DIR", "TOOLCHAINS", "SDKROOT",
+    // Shell startup and tracing.
+    "ENV", "ZDOTDIR", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND", "IFS",
+    // Interpreter startup code.
+    "NODE_OPTIONS", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "RUBYOPT", "PERL5OPT",
+    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+]
+
+/// Dynamic loader settings, bash settings such as `BASH_ENV`, and git
+/// settings, several of which run commands whenever a package manager calls
+/// git.
+private let restrictedEnvironmentPrefixes = ["LD_", "DYLD_", "BASH_", "GIT_"]
+
+/// Module search paths. Workspace paths load project code, which the build
+/// runs anyway; any other path would load code from elsewhere.
+private let workspaceOnlyEnvironmentNames: Set<String> = [
+    "PYTHONPATH", "NODE_PATH", "RUBYLIB", "PERL5LIB", "PERLLIB",
+]
+
+private func validateEnvironmentAssignment(
+    _ assignment: (name: String, value: String)
+) throws {
+    let name = assignment.name.uppercased()
+    if restrictedEnvironmentNames.contains(name)
+        || restrictedEnvironmentPrefixes.contains(where: { name.hasPrefix($0) }) {
+        throw RestrictedBashCommandError(
+            message: "environment variable '\(assignment.name)' is not allowed"
+        )
+    }
+    // Split as bytes, as the loader does, so no mark next to a `:` hides it.
+    if workspaceOnlyEnvironmentNames.contains(name),
+       !assignment.value.utf8.split(separator: UInt8(ascii: ":"))
+           .allSatisfy({ isWorkspaceRelativePath(Array($0)) }) {
+        throw RestrictedBashCommandError(
+            message: "environment variable '\(assignment.name)' may only list workspace paths"
+        )
+    }
+}
+
+/// The executable word must name a program. A word that starts with `-` is an
+/// option, such as one left after `uv run`; a word with `=` is one a shell
+/// may read as an assignment, such as `NAME+=value`, before running the next
+/// word as the program; and a word with `:` may be read as a URL, such as
+/// `https://host/pytest`, which `uv run` downloads and runs as a script.
+///
+/// A path to the executable must stay in the workspace (relative, without
+/// `..`) or sit in a directory on the host's PATH, so an allowed tool name
+/// cannot run a same-named program from anywhere else. The word must be
+/// literal, since a glob or `~` lets the shell pick the file. Paths are
+/// compared as bytes, as the kernel reads them.
+private func validateExecutableWord(
+    _ word: RestrictedShellWord,
+    environment: [String: String]
+) throws {
+    guard word.isLiteral else {
+        throw RestrictedBashCommandError(
+            message: "executable '\(word.text)' must be written literally"
+        )
+    }
+    let path = Array(word.text.utf8)
+    guard !startsWithDash(word.text),
+          !path.contains(UInt8(ascii: "=")),
+          !path.contains(UInt8(ascii: ":")) else {
+        throw RestrictedBashCommandError(
+            message: "'\(word.text)' is not a build/test executable"
+        )
+    }
+    guard path.contains(slashByte) else { return }
+    let allowed: Bool
+    if path.first == slashByte {
+        let searchDirectories = (environment["PATH"] ?? "").utf8
+            .split(separator: UInt8(ascii: ":"))
+            .filter { $0.first == slashByte }
+            .compactMap { plainPathComponents(Array($0)) }
+        allowed = plainPathComponents(path).map { components in
+            searchDirectories.contains(Array(components.dropLast()))
+        } ?? false
+    } else {
+        allowed = isWorkspaceRelativePath(path)
+    }
+    guard allowed else {
+        throw RestrictedBashCommandError(
+            message: "executable path '\(word.text)' is outside the workspace and PATH"
+        )
+    }
+}
+
+private let slashByte = UInt8(ascii: "/")
+
+/// The components of a UTF-8 `path` without empty or `.` parts, or nil when
+/// it climbs with `..`.
+private func plainPathComponents(_ path: [UInt8]) -> [[UInt8]]? {
+    let components = path.split(separator: slashByte).map(Array.init).filter { $0 != Array(".".utf8) }
+    return components.contains(Array("..".utf8)) ? nil : components
+}
+
+/// A relative UTF-8 path that cannot leave the working directory. A leading
+/// `~` or `=` is refused because a shell may expand it to a path elsewhere:
+/// `~` to a home directory and, in zsh, `=name` to a program on PATH.
+private func isWorkspaceRelativePath(_ path: [UInt8]) -> Bool {
+    if let first = path.first, [slashByte, UInt8(ascii: "~"), UInt8(ascii: "=")].contains(first) {
+        return false
+    }
+    return plainPathComponents(path) != nil
+}
+
+/// Whether a program reads `word` as an option: its first byte is `-`.
+private func startsWithDash(_ word: String) -> Bool {
+    word.utf8.first == UInt8(ascii: "-")
+}
+
+/// Split `NAME=value` at its first `=`.
+private func splitAssignment(_ word: String) -> (name: String, value: String)? {
+    let scalars = word.unicodeScalars
+    guard let equal = scalars.firstIndex(of: "=") else { return nil }
+    return (
+        String(String.UnicodeScalarView(scalars[..<equal])),
+        String(String.UnicodeScalarView(scalars[scalars.index(after: equal)...]))
+    )
+}
+
+/// A shell variable name: ASCII letters, digits and `_`, not starting with a
+/// digit.
+private func isShellName(_ name: String) -> Bool {
+    let scalars = name.unicodeScalars
+    guard let first = scalars.first, !("0"..."9").contains(first) else { return false }
+    return scalars.allSatisfy { $0 == "_" || isASCIIAlphanumeric($0) }
 }
 
 private func packageManagerArgumentsAreBuildOrTest(_ arguments: [String]) -> Bool {
