@@ -36,12 +36,15 @@ struct BashCommandPolicyTests {
 
     private func rejectionMessage(
         _ tool: AgentTool,
-        _ command: String
+        _ command: String,
+        runInBackground: Bool = false
     ) async -> String? {
+        var arguments: [String: JSONValue] = ["command": .string(command)]
+        if runInBackground { arguments["run_in_background"] = .bool(true) }
         do {
             _ = try await tool.execute(
                 "policy-command",
-                .object(["command": .string(command)]),
+                .object(arguments),
                 nil,
                 nil
             )
@@ -95,6 +98,38 @@ struct BashCommandPolicyTests {
         "xcrun --toolchain xcodebuild rm -rf src",
         // cmake only builds when --build comes first.
         "cmake -E rm -rf src --build",
+        // The shell reads bytes. A combining mark after a quote, `(`, `=` or
+        // `/`, or a prepended mark before an operator or `:`, must not hide
+        // that ASCII character from the parser.
+        "pytest 'x'\u{0301} ;touch S1 #'",
+        "pytest \"x\"\u{0301} ;touch S1 #\"",
+        "pytest \"$(\u{0301}; touch S21)\"",
+        "pytest x\u{0600};touch S2",
+        "pytest x\u{0600}|touch S4",
+        "pytest x\u{0600}>S6",
+        "pytest x\u{0600}& touch S16",
+        "X=\u{0301}/pytest touch S22",
+        "env PATH=\u{0301}/tmp/evil swift test",
+        "/\u{0301}tmp/pytest",
+        "PYTHONPATH=../\u{0301}outside pytest",
+        "PYTHONPATH=src\u{0600}:/tmp/elsewhere pytest",
+        // After a leading `time`, bash, zsh and ksh read assignments, while
+        // dash's /usr/bin/time runs the assignment word as the program.
+        "time X=/pytest touch S9",
+        "time LD_PRELOAD=/tmp/evil/pytest pytest",
+        "time PATH=/tmp/evil:/usr/bin/pytest pytest",
+        "time CI=1 swift test",
+        "CI=1 time X=a/pytest touch S9",
+        // `NAME+=value` is an assignment in bash, zsh and ksh.
+        "X+=a/pytest touch S20",
+        "PATH+=:/tmp/evil/pytest pytest",
+        // An option where the program goes, after a wrapper.
+        "uv run --cache-dir=/tmp/pytest touch S10",
+        "poetry run --directory=x/pytest touch S12",
+        "bundle exec --gemfile=/tmp/evil/rspec rspec",
+        // env reads no options after `--` or after an assignment.
+        "env -- -i pytest",
+        "env CI=1 -i pytest",
     ])
     func rejectsCommand(_ command: String) async {
         let recorder = CommandRecorder()
@@ -129,6 +164,13 @@ struct BashCommandPolicyTests {
         "uv run pytest -k 'not slow'",
         "cmake --build build --target check",
         "make -j8 test",
+        "CI=1 time swift test",
+        "time env CI=1 swift test",
+        "env -i -- CI=1 cargo test",
+        // Inside double quotes the backslash stays: pytest gets `\clean`.
+        "pytest -k \"\\clean\"",
+        "swift test --filter 'Caf\u{00E9}Tests'",
+        "pytest -k \"cafe\u{0301}\"",
     ])
     func acceptsCommand(_ command: String) async throws {
         let recorder = CommandRecorder()
@@ -169,6 +211,41 @@ struct BashCommandPolicyTests {
         #expect(!FileManager.default.fileExists(
             atPath: cwdDir.appendingPathComponent("policy-sentinel").path
         ))
+    }
+
+    @Test("bypasses are rejected on every dispatch path before a shell starts", arguments: [
+        "pytest 'x'\u{0301} ;touch SENTINEL #'",
+        "pytest x\u{0600};touch SENTINEL",
+        "time X=/pytest touch SENTINEL",
+        "X+=a/pytest touch SENTINEL",
+        "uv run --cache-dir=x/pytest touch SENTINEL",
+    ])
+    func bypassRejectedOnEveryPath(_ template: String) async throws {
+        let cwdDir = makeTempDir()
+        let outputDir = makeTempDir()
+        defer {
+            try? FileManager.default.removeItem(at: cwdDir)
+            try? FileManager.default.removeItem(at: outputDir)
+        }
+        // An absolute path, so a command that wrongly runs after cleanup
+        // cannot leave a file in the test process's directory.
+        let sentinel = cwdDir.appendingPathComponent("policy-sentinel").path
+        let command = template.replacingOccurrences(of: "SENTINEL", with: sentinel)
+        let legacy = createBashTool(cwd: cwdDir.path, options: BashToolOptions(
+            environment: testBashEnvironment,
+            commandPolicy: .buildAndTestOnly
+        ))
+        let managed = createBashTool(cwd: cwdDir.path, options: BashToolOptions(
+            environment: testBashEnvironment,
+            manager: BackgroundTaskManager(outputDir: outputDir),
+            commandPolicy: .buildAndTestOnly
+        ))
+        // Legacy pipe, foreground with auto-background, explicit background.
+        for (tool, runInBackground) in [(legacy, false), (managed, false), (managed, true)] {
+            let message = await rejectionMessage(tool, command, runInBackground: runInBackground)
+            #expect(message?.contains("build-and-test policy") == true, "\(message ?? "accepted")")
+        }
+        #expect(!FileManager.default.fileExists(atPath: sentinel))
     }
 
     @Test("rejects every command when the tool's shell is not a POSIX shell")
