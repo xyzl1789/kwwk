@@ -650,9 +650,10 @@ private func validateBuildAndTestWords(
 /// or that load code into every interpreter a build starts, compared without
 /// case because zsh ties `path` to `PATH`. The list covers the common ways to
 /// run code from outside the build and is not exhaustive. Settings read by one
-/// build tool, such as `CC`, `RUSTC_WRAPPER`, `RUSTFLAGS` or `JAVA_HOME`, and
-/// ones that move where a tool reads its configuration, such as `HOME`, stay
+/// build tool, such as `CC`, `RUSTC_WRAPPER`, `RUSTFLAGS` or `JAVA_HOME`, stay
 /// allowed: that tool's own command-line options reach the same settings.
+/// `HOME` stays allowed too, although it also moves where tools read their
+/// configuration and where Python finds user-installed packages.
 private let restrictedEnvironmentNames: Set<String> = [
     // Program lookup, including the toolchain and SDK Xcode's shims pick.
     "PATH", "SHELL", "DEVELOPER_DIR", "TOOLCHAINS", "SDKROOT",
@@ -695,13 +696,14 @@ private func validateEnvironmentAssignment(
 }
 
 /// The executable word must name a program. A word that starts with `-` is an
-/// option, such as one left after `uv run`, and a word with `=` is one a shell
+/// option, such as one left after `uv run`; a word with `=` is one a shell
 /// may read as an assignment, such as `NAME+=value`, before running the next
-/// word as the program.
+/// word as the program; and a word with `:` may be read as a URL, such as
+/// `https://host/pytest`, which `uv run` downloads and runs as a script.
 ///
 /// A path to the executable must stay in the workspace (relative, without
 /// `..`) or sit in a directory on the host's PATH, so an allowed tool name
-/// cannot run a same-named binary from anywhere else. The word must be
+/// cannot run a same-named program from anywhere else. The word must be
 /// literal, since a glob or `~` lets the shell pick the file. Paths are
 /// compared as bytes, as the kernel reads them.
 private func validateExecutableWord(
@@ -714,7 +716,9 @@ private func validateExecutableWord(
         )
     }
     let path = Array(word.text.utf8)
-    guard !startsWithDash(word.text), !path.contains(UInt8(ascii: "=")) else {
+    guard !startsWithDash(word.text),
+          !path.contains(UInt8(ascii: "=")),
+          !path.contains(UInt8(ascii: ":")) else {
         throw RestrictedBashCommandError(
             message: "'\(word.text)' is not a build/test executable"
         )
@@ -748,9 +752,14 @@ private func plainPathComponents(_ path: [UInt8]) -> [[UInt8]]? {
     return components.contains(Array("..".utf8)) ? nil : components
 }
 
-/// A relative UTF-8 path that cannot leave the working directory.
+/// A relative UTF-8 path that cannot leave the working directory. A leading
+/// `~` or `=` is refused because a shell may expand it to a path elsewhere:
+/// `~` to a home directory and, in zsh, `=name` to a program on PATH.
 private func isWorkspaceRelativePath(_ path: [UInt8]) -> Bool {
-    path.first != slashByte && path.first != UInt8(ascii: "~") && plainPathComponents(path) != nil
+    if let first = path.first, [slashByte, UInt8(ascii: "~"), UInt8(ascii: "=")].contains(first) {
+        return false
+    }
+    return plainPathComponents(path) != nil
 }
 
 /// Whether a program reads `word` as an option: its first byte is `-`.

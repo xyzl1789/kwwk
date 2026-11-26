@@ -87,6 +87,8 @@ struct BashCommandPolicyTests {
         "GIT_CONFIG_COUNT=1 swift build",
         "PYTHONPATH=/tmp/elsewhere pytest",
         "PYTHONPATH=src:../outside pytest",
+        // zsh expands `=name` in an assignment to a program on PATH.
+        "PYTHONPATH=src:=ls pytest",
         // A quoted name is not an assignment, so the shell runs `CI=1`.
         "\"CI\"=1 pytest",
         // Same-named binaries outside the workspace and PATH.
@@ -94,6 +96,12 @@ struct BashCommandPolicyTests {
         "/usr/bin/../../tmp/pytest",
         "../other/pytest",
         "~/bin/pytest",
+        // A glob lets the shell pick the program.
+        "py?est",
+        "./bin/py*",
+        // `uv run` downloads and runs a URL as a script.
+        "uv run https://example.invalid/pytest",
+        "uv run http://127.0.0.1:8000/pytest -q",
         // A value-taking xcrun option would hide the real tool name.
         "xcrun --toolchain xcodebuild rm -rf src",
         // cmake only builds when --build comes first.
@@ -109,24 +117,24 @@ struct BashCommandPolicyTests {
         "pytest x\u{0600}>S6",
         "pytest x\u{0600}& touch S16",
         "X=\u{0301}/pytest touch S22",
-        "env PATH=\u{0301}/tmp/evil swift test",
+        "env PATH=\u{0301}/tmp/elsewhere swift test",
         "/\u{0301}tmp/pytest",
         "PYTHONPATH=../\u{0301}outside pytest",
         "PYTHONPATH=src\u{0600}:/tmp/elsewhere pytest",
         // After a leading `time`, bash, zsh and ksh read assignments, while
         // dash's /usr/bin/time runs the assignment word as the program.
         "time X=/pytest touch S9",
-        "time LD_PRELOAD=/tmp/evil/pytest pytest",
-        "time PATH=/tmp/evil:/usr/bin/pytest pytest",
+        "time LD_PRELOAD=/tmp/elsewhere/pytest pytest",
+        "time PATH=/tmp/elsewhere:/usr/bin/pytest pytest",
         "time CI=1 swift test",
         "CI=1 time X=a/pytest touch S9",
         // `NAME+=value` is an assignment in bash, zsh and ksh.
         "X+=a/pytest touch S20",
-        "PATH+=:/tmp/evil/pytest pytest",
+        "PATH+=:/tmp/elsewhere/pytest pytest",
         // An option where the program goes, after a wrapper.
         "uv run --cache-dir=/tmp/pytest touch S10",
         "poetry run --directory=x/pytest touch S12",
-        "bundle exec --gemfile=/tmp/evil/rspec rspec",
+        "bundle exec --gemfile=/tmp/elsewhere/rspec rspec",
         // env reads no options after `--` or after an assignment.
         "env -- -i pytest",
         "env CI=1 -i pytest",
@@ -213,14 +221,14 @@ struct BashCommandPolicyTests {
         ))
     }
 
-    @Test("bypasses are rejected on every dispatch path before a shell starts", arguments: [
+    @Test("rejected on every dispatch path before a shell starts", arguments: [
         "pytest 'x'\u{0301} ;touch SENTINEL #'",
         "pytest x\u{0600};touch SENTINEL",
         "time X=/pytest touch SENTINEL",
         "X+=a/pytest touch SENTINEL",
         "uv run --cache-dir=x/pytest touch SENTINEL",
     ])
-    func bypassRejectedOnEveryPath(_ template: String) async throws {
+    func rejectedOnEveryDispatchPath(_ template: String) async throws {
         let cwdDir = makeTempDir()
         let outputDir = makeTempDir()
         defer {
@@ -270,6 +278,39 @@ struct BashCommandPolicyTests {
             let message = await rejectionMessage(tool, "swift test")
             #expect(message?.contains("POSIX") == true, "\(message ?? "accepted")")
         }
+    }
+
+    @Test("an explicit local executor's PATH and shell are the ones checked")
+    func explicitLocalExecutorChecked() async throws {
+        let cwdDir = makeTempDir()
+        defer { try? FileManager.default.removeItem(at: cwdDir) }
+        // The tool's environment has /usr/bin on PATH; the executor that
+        // runs the command does not.
+        let narrowPath = createBashTool(cwd: cwdDir.path, options: BashToolOptions(
+            environment: testBashEnvironment,
+            operations: LocalBashOperations(
+                cwd: cwdDir.path,
+                environment: ["PATH": "/opt/tools/bin"]
+            ),
+            commandPolicy: .buildAndTestOnly
+        ))
+        let pathMessage = await rejectionMessage(narrowPath, "/usr/bin/python3 -m pytest -q")
+        #expect(
+            pathMessage?.contains("outside the workspace and PATH") == true,
+            "\(pathMessage ?? "accepted")"
+        )
+
+        let fishExecutor = createBashTool(cwd: cwdDir.path, options: BashToolOptions(
+            environment: testBashEnvironment,
+            operations: LocalBashOperations(
+                cwd: cwdDir.path,
+                shellPath: "/usr/local/bin/fish",
+                environment: testBashEnvironment
+            ),
+            commandPolicy: .buildAndTestOnly
+        ))
+        let shellMessage = await rejectionMessage(fishExecutor, "swift test")
+        #expect(shellMessage?.contains("POSIX") == true, "\(shellMessage ?? "accepted")")
     }
 
     @Test("a custom executor's shell is not judged by the tool's shellPath")
