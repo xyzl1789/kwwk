@@ -123,9 +123,13 @@ public enum MCPOAuth {
         let discoveryStore = provider as? any MCPOAuthDiscoveryStore
         let cached = try await discoveryStore?.discoveryState()
 
-        var resourceMetadataURL = options.resourceMetadataURL
+        // A hint `isAllowedEndpoint` refuses is neither read nor saved.
+        func allowedHint(_ url: URL?) -> URL? {
+            url.flatMap { isAllowedEndpoint($0, serverURL: options.serverURL) ? $0 : nil }
+        }
+        var resourceMetadataURL = allowedHint(options.resourceMetadataURL)
         if resourceMetadataURL == nil, let saved = cached?.resourceMetadataURL {
-            resourceMetadataURL = URL(string: saved)
+            resourceMetadataURL = allowedHint(URL(string: saved))
         }
 
         let authorizationServerURL: String
@@ -142,7 +146,8 @@ public enum MCPOAuth {
                 metadata = try await discoverAuthorizationServerMetadata(
                     authorizationServerURL,
                     skipIssuerValidation: options.skipIssuerMetadataValidation,
-                    httpClient: http
+                    httpClient: http,
+                    serverURL: options.serverURL
                 )
             }
             if resourceMetadata == nil {
@@ -255,7 +260,8 @@ public enum MCPOAuth {
                     metadata: metadata,
                     clientMetadata: clientMetadata,
                     scope: resolvedScope,
-                    httpClient: http
+                    httpClient: http,
+                    serverURL: options.serverURL
                 )
                 registered.issuer = issuer
                 try await registrationStore.saveClientInformation(registered, context: context)
@@ -280,7 +286,8 @@ public enum MCPOAuth {
                 codeVerifier: verifier,
                 redirectURI: provider.redirectURL,
                 resource: resource,
-                httpClient: http
+                httpClient: http,
+                serverURL: options.serverURL
             )
             var stamped = tokens
             stamped.issuer = issuer
@@ -303,7 +310,8 @@ public enum MCPOAuth {
                     client: client,
                     refreshToken: refreshToken,
                     resource: resource,
-                    httpClient: http
+                    httpClient: http,
+                    serverURL: options.serverURL
                 )
                 refreshed.issuer = issuer
                 try await provider.saveTokens(refreshed, context: context)
@@ -334,7 +342,8 @@ public enum MCPOAuth {
             redirectURI: provider.redirectURL,
             scope: resolvedScope,
             state: state,
-            resource: resource
+            resource: resource,
+            serverURL: options.serverURL
         )
         try await provider.saveCodeVerifier(start.codeVerifier)
         try await provider.redirectToAuthorization(start.authorizationURL)

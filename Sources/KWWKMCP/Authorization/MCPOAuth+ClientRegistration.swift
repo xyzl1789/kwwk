@@ -19,31 +19,24 @@ extension MCPOAuth {
         for raw in redirectURIs {
             guard let url = URL(string: raw), let scheme = url.scheme?.lowercased() else { continue }
             if scheme != "http" && scheme != "https" { return "native" }
-            if isLoopbackHost(url.host) { return "native" }
+            if isStrictLoopback(url) { return "native" }
         }
         return "web"
-    }
-
-    static func isLoopbackHost(_ host: String?) -> Bool {
-        guard let host = host?.lowercased() else { return false }
-        return host == "localhost"
-            || host.hasSuffix(".localhost")
-            || host == "127.0.0.1"
-            || host == "::1"
-            || host == "[::1]"
     }
 
     static func isHTTPSURLWithPath(_ url: URL) -> Bool {
         url.scheme?.lowercased() == "https" && !url.path.isEmpty && url.path != "/"
     }
 
-    /// RFC 7591 dynamic client registration.
+    /// RFC 7591 dynamic client registration. With `serverURL`, the MCP
+    /// server's, the endpoint is held to `isAllowedEndpoint`.
     public static func registerClient(
         authorizationServerURL: String,
         metadata: MCPAuthorizationServerMetadata?,
         clientMetadata: MCPOAuthClientMetadata,
         scope: String?,
-        httpClient: any MCPAuthHTTPClient
+        httpClient: any MCPAuthHTTPClient,
+        serverURL: URL? = nil
     ) async throws -> MCPOAuthClientInformation {
         let endpoint: URL
         if let metadata {
@@ -57,6 +50,9 @@ extension MCPOAuth {
             }
             endpoint = url
         }
+        guard isAllowedEndpoint(endpoint, serverURL: serverURL) else {
+            throw MCPAuthError.incompatibleServer("invalid registration endpoint \(endpoint.absoluteString)")
+        }
         var submitted = clientMetadata
         if let scope { submitted.scope = scope }
         let encoder = JSONEncoder()
@@ -68,7 +64,7 @@ extension MCPOAuth {
             body: try encoder.encode(submitted)
         ), using: httpClient)
         guard response.isSuccess else {
-            throw MCPAuthError.registrationRejected(status: response.status, body: response.text)
+            throw MCPAuthError.registrationRejected(status: response.status, body: String(response.text.prefix(500)))
         }
         do {
             var information = try JSONDecoder().decode(MCPOAuthClientInformation.self, from: response.body)

@@ -53,10 +53,16 @@ public final class MCPStreamableHTTPTransport: MCPTransport, Sendable {
         var resourceMetadataURL: URL?
     }
 
+    /// The client of every transport given none: one for the process, like
+    /// `URLSessionHTTPClient.shared`, that follows a redirect only within
+    /// the server's origin. A server cannot send its requests, with their
+    /// session id, configured headers and messages, on to another host.
+    public static let defaultHTTPClient = URLSessionHTTPClient(redirects: .sameOrigin)
+
     /// - Parameters:
     ///   - headers: Extra request headers. A token from `auth` replaces any
     ///     `Authorization` header here.
-    ///   - httpClient: Injected for tests; defaults to the shared URLSession client.
+    ///   - httpClient: Injected for tests; defaults to `defaultHTTPClient`.
     ///   - requestTimeoutSeconds: Idle timeout of each POST.
     ///   - auth: How to authenticate; nil sends `headers` only.
     ///   - authHTTPClient: Client of the OAuth requests (discovery, tokens).
@@ -72,7 +78,7 @@ public final class MCPStreamableHTTPTransport: MCPTransport, Sendable {
     ) {
         self.url = url
         self.headers = headers
-        self.httpClient = httpClient ?? URLSessionHTTPClient.shared
+        self.httpClient = httpClient ?? Self.defaultHTTPClient
         self.requestTimeoutSeconds = requestTimeoutSeconds
         self.auth = auth
         let authHTTP = authHTTPClient ?? URLSessionMCPAuthHTTPClient.shared
@@ -235,7 +241,10 @@ public final class MCPStreamableHTTPTransport: MCPTransport, Sendable {
     ) async throws {
         let challenge = MCPAuthChallenge(header: response.value(forHTTPHeaderField: "WWW-Authenticate"))
         state.withLockedValue { state in
-            if let metadataURL = challenge.resourceMetadataURL { state.resourceMetadataURL = metadataURL }
+            if let metadataURL = challenge.resourceMetadataURL,
+               MCPOAuth.isAllowedEndpoint(metadataURL, serverURL: url) {
+                state.resourceMetadataURL = metadataURL
+            }
             state.scope = MCPOAuth.scopeUnion(state.scope, challenge.scope)
         }
         guard let authProvider else {
@@ -261,13 +270,16 @@ public final class MCPStreamableHTTPTransport: MCPTransport, Sendable {
             )
         }
         let tokens = try await provider.tokens(nil)
+        let url = self.url
         let (union, metadataURL): (String?, URL?) = state.withLockedValue { state in
-            if let metadataURL = challenge.resourceMetadataURL { state.resourceMetadataURL = metadataURL }
+            if let metadataURL = challenge.resourceMetadataURL,
+               MCPOAuth.isAllowedEndpoint(metadataURL, serverURL: url) {
+                state.resourceMetadataURL = metadataURL
+            }
             state.scope = MCPOAuth.scopeUnion(state.scope, tokens?.scope, challenge.scope)
             return (state.scope, state.resourceMetadataURL)
         }
         let interactive = auth?.isInteractive ?? false
-        let url = url
         let http = authHTTPClient
         let result = try await authGate.run {
             try await MCPOAuth.auth(provider, options: MCPOAuthOptions(
